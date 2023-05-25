@@ -1,40 +1,40 @@
-# Ultralytics YOLO 🚀, GPL-3.0 license
+# Ultralytics YOLO 🚀, AGPL-3.0 license
 
 import os
 import platform
-import shutil
+import random
 import sys
 import threading
 import time
 from pathlib import Path
-from random import random
 
 import requests
+from tqdm import tqdm
 
-from ultralytics.yolo.utils import (DEFAULT_CFG_DICT, LOGGER, RANK, SETTINGS, TryExcept, colorstr, emojis,
-                                    get_git_origin_url, is_colab, is_docker, is_git_dir, is_github_actions_ci,
-                                    is_jupyter, is_kaggle, is_pip_package, is_pytest_running)
+from ultralytics.yolo.utils import (ENVIRONMENT, LOGGER, ONLINE, RANK, SETTINGS, TESTS_RUNNING, TQDM_BAR_FORMAT,
+                                    TryExcept, __version__, colorstr, get_git_origin_url, is_colab, is_git_dir,
+                                    is_pip_package)
 
-PREFIX = colorstr('Ultralytics: ')
+PREFIX = colorstr('Ultralytics HUB: ')
 HELP_MSG = 'If this issue persists please visit https://github.com/ultralytics/hub/issues for assistance.'
-HUB_API_ROOT = os.environ.get("ULTRALYTICS_HUB_API", "https://api.ultralytics.com")
-
-
-def check_dataset_disk_space(url='https://ultralytics.com/assets/coco128.zip', sf=2.0):
-    # Check that url fits on disk with safety factor sf, i.e. require 2GB free if url size is 1GB with sf=2.0
-    gib = 1 << 30  # bytes per GiB
-    data = int(requests.head(url).headers['Content-Length']) / gib  # dataset size (GB)
-    total, used, free = (x / gib for x in shutil.disk_usage("/"))  # bytes
-    LOGGER.info(f'{PREFIX}{data:.3f} GB dataset, {free:.1f}/{total:.1f} GB free disk space')
-    if data * sf < free:
-        return True  # sufficient space
-    LOGGER.warning(f'{PREFIX}WARNING: Insufficient free disk space {free:.1f} GB < {data * sf:.3f} GB required, '
-                   f'training cancelled ❌. Please free {data * sf - free:.1f} GB additional disk space and try again.')
-    return False  # insufficient space
+HUB_API_ROOT = os.environ.get('ULTRALYTICS_HUB_API', 'https://api.ultralytics.com')
 
 
 def request_with_credentials(url: str) -> any:
-    """ Make an ajax request with cookies attached """
+    """
+    Make an AJAX request with cookies attached in a Google Colab environment.
+
+    Args:
+        url (str): The URL to make the request to.
+
+    Returns:
+        (any): The response data from the AJAX request.
+
+    Raises:
+        OSError: If the function is not run in a Google Colab environment.
+    """
+    if not is_colab():
+        raise OSError('request_with_credentials() must run in a Colab environment')
     from google.colab import output  # noqa
     from IPython import display  # noqa
     display.display(
@@ -54,63 +54,67 @@ def request_with_credentials(url: str) -> any:
                 });
             });
             """ % url))
-    return output.eval_js("_hub_tmp")
+    return output.eval_js('_hub_tmp')
 
 
-# Deprecated TODO: eliminate this function?
-def split_key(key=''):
+def requests_with_progress(method, url, **kwargs):
     """
-    Verify and split a 'api_key[sep]model_id' string, sep is one of '.' or '_'
+    Make an HTTP request using the specified method and URL, with an optional progress bar.
 
     Args:
-        key (str): The model key to split. If not provided, the user will be prompted to enter it.
+        method (str): The HTTP method to use (e.g. 'GET', 'POST').
+        url (str): The URL to send the request to.
+        **kwargs (dict): Additional keyword arguments to pass to the underlying `requests.request` function.
 
     Returns:
-        Tuple[str, str]: A tuple containing the API key and model ID.
+        (requests.Response): The response object from the HTTP request.
+
+    Note:
+        If 'progress' is set to True, the progress bar will display the download progress
+        for responses with a known content length.
     """
+    progress = kwargs.pop('progress', False)
+    if not progress:
+        return requests.request(method, url, **kwargs)
+    response = requests.request(method, url, stream=True, **kwargs)
+    total = int(response.headers.get('content-length', 0))  # total size
+    pbar = tqdm(total=total, unit='B', unit_scale=True, unit_divisor=1024, bar_format=TQDM_BAR_FORMAT)
+    for data in response.iter_content(chunk_size=1024):
+        pbar.update(len(data))
+    pbar.close()
+    return response
 
-    import getpass
 
-    error_string = emojis(f'{PREFIX}Invalid API key ⚠️\n')  # error string
-    if not key:
-        key = getpass.getpass('Enter model key: ')
-    sep = '_' if '_' in key else '.' if '.' in key else None  # separator
-    assert sep, error_string
-    api_key, model_id = key.split(sep)
-    assert len(api_key) and len(model_id), error_string
-    return api_key, model_id
-
-
-def smart_request(*args, retry=3, timeout=30, thread=True, code=-1, method="post", verbose=True, **kwargs):
+def smart_request(method, url, retry=3, timeout=30, thread=True, code=-1, verbose=True, progress=False, **kwargs):
     """
     Makes an HTTP request using the 'requests' library, with exponential backoff retries up to a specified timeout.
 
     Args:
-        *args: Positional arguments to be passed to the requests function specified in method.
+        method (str): The HTTP method to use for the request. Choices are 'post' and 'get'.
+        url (str): The URL to make the request to.
         retry (int, optional): Number of retries to attempt before giving up. Default is 3.
         timeout (int, optional): Timeout in seconds after which the function will give up retrying. Default is 30.
         thread (bool, optional): Whether to execute the request in a separate daemon thread. Default is True.
         code (int, optional): An identifier for the request, used for logging purposes. Default is -1.
-        method (str, optional): The HTTP method to use for the request. Choices are 'post' and 'get'. Default is 'post'.
         verbose (bool, optional): A flag to determine whether to print out to console or not. Default is True.
-        **kwargs: Keyword arguments to be passed to the requests function specified in method.
+        progress (bool, optional): Whether to show a progress bar during the request. Default is False.
+        **kwargs (dict): Keyword arguments to be passed to the requests function specified in method.
 
     Returns:
-        requests.Response: The HTTP response object. If the request is executed in a separate thread, returns None.
+        (requests.Response): The HTTP response object. If the request is executed in a separate thread, returns None.
     """
     retry_codes = (408, 500)  # retry only these codes
 
-    def func(*func_args, **func_kwargs):
+    @TryExcept(verbose=verbose)
+    def func(func_method, func_url, **func_kwargs):
+        """Make HTTP requests with retries and timeouts, with optional progress tracking."""
         r = None  # response
         t0 = time.time()  # initial time for timer
         for i in range(retry + 1):
             if (time.time() - t0) > timeout:
                 break
-            if method == 'post':
-                r = requests.post(*func_args, **func_kwargs)  # i.e. post(url, data, json, files)
-            elif method == 'get':
-                r = requests.get(*func_args, **func_kwargs)  # i.e. get(url, data, json, files)
-            if r.status_code == 200:
+            r = requests_with_progress(func_method, func_url, **func_kwargs)  # i.e. get(url, data, json, files)
+            if r.status_code < 300:  # return codes in the 2xx range are generally considered "good" or "successful"
                 break
             try:
                 m = r.json().get('message', 'No JSON message.')
@@ -124,69 +128,90 @@ def smart_request(*args, retry=3, timeout=30, thread=True, code=-1, method="post
                     m = f"Rate limit reached ({h['X-RateLimit-Remaining']}/{h['X-RateLimit-Limit']}). " \
                         f"Please retry after {h['Retry-After']}s."
                 if verbose:
-                    LOGGER.warning(f"{PREFIX}{m} {HELP_MSG} ({r.status_code} #{code})")
+                    LOGGER.warning(f'{PREFIX}{m} {HELP_MSG} ({r.status_code} #{code})')
                 if r.status_code not in retry_codes:
                     return r
             time.sleep(2 ** i)  # exponential standoff
         return r
 
+    args = method, url
+    kwargs['progress'] = progress
     if thread:
         threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True).start()
     else:
         return func(*args, **kwargs)
 
 
-class Traces:
+class Events:
+    """
+    A class for collecting anonymous event analytics. Event analytics are enabled when sync=True in settings and
+    disabled when sync=False. Run 'yolo settings' to see and update settings YAML file.
+
+    Attributes:
+        url (str): The URL to send anonymous events.
+        rate_limit (float): The rate limit in seconds for sending events.
+        metadata (dict): A dictionary containing metadata about the environment.
+        enabled (bool): A flag to enable or disable Events based on certain conditions.
+    """
+
+    url = 'https://www.google-analytics.com/mp/collect?measurement_id=G-X8NCJYTQXM&api_secret=QLQrATrNSwGRFRLE-cbHJw'
 
     def __init__(self):
         """
-        Initialize Traces for error tracking and reporting if tests are not currently running.
+        Initializes the Events object with default values for events, rate_limit, and metadata.
         """
-        from ultralytics import __version__
-        env = 'Colab' if is_colab() else 'Kaggle' if is_kaggle() else 'Jupyter' if is_jupyter() else \
-            'Docker' if is_docker() else platform.system()
-        self.rate_limit = 3.0  # rate limit (seconds)
-        self.t = time.time()  # rate limit timer (seconds)
+        self.events = []  # events list
+        self.rate_limit = 60.0  # rate limit (seconds)
+        self.t = 0.0  # rate limit timer (seconds)
         self.metadata = {
-            "sys_argv_name": Path(sys.argv[0]).name,
-            "install": 'git' if is_git_dir() else 'pip' if is_pip_package() else 'other',
-            "python": platform.python_version(),
-            "release": __version__,
-            "environment": env}
-        self.enabled = SETTINGS['sync'] and \
-                       RANK in {-1, 0} and \
-                       not is_pytest_running() and \
-                       not is_github_actions_ci() and \
-                       (is_pip_package() or get_git_origin_url() == "https://github.com/ultralytics/ultralytics.git")
+            'cli': Path(sys.argv[0]).name == 'yolo',
+            'install': 'git' if is_git_dir() else 'pip' if is_pip_package() else 'other',
+            'python': '.'.join(platform.python_version_tuple()[:2]),  # i.e. 3.10
+            'version': __version__,
+            'env': ENVIRONMENT,
+            'session_id': round(random.random() * 1E15),
+            'engagement_time_msec': 1000}
+        self.enabled = \
+            SETTINGS['sync'] and \
+            RANK in (-1, 0) and \
+            not TESTS_RUNNING and \
+            ONLINE and \
+            (is_pip_package() or get_git_origin_url() == 'https://github.com/ultralytics/ultralytics.git')
 
-    @TryExcept(verbose=False)
-    def __call__(self, cfg, all_keys=False, traces_sample_rate=1.0):
+    def __call__(self, cfg):
         """
-       Sync traces data if enabled in the global settings
+        Attempts to add a new event to the events list and send events if the rate limit is reached.
 
         Args:
-            cfg (IterableSimpleNamespace): Configuration for the task and mode.
-            all_keys (bool): Sync all items, not just non-default values.
-            traces_sample_rate (float): Fraction of traces captured from 0.0 to 1.0
+            cfg (IterableSimpleNamespace): The configuration object containing mode and task information.
         """
-        t = time.time()  # current time
-        if self.enabled and random() < traces_sample_rate and (t - self.t) > self.rate_limit:
-            self.t = t  # reset rate limit timer
-            cfg = vars(cfg)  # convert type from IterableSimpleNamespace to dict
-            if not all_keys:  # filter cfg
-                include_keys = {'task', 'mode'}  # always include
-                cfg = {k: v for k, v in cfg.items() if v != DEFAULT_CFG_DICT.get(k, None) or k in include_keys}
-            trace = {'uuid': SETTINGS['uuid'], 'cfg': cfg, 'metadata': self.metadata}
+        if not self.enabled:
+            # Events disabled, do nothing
+            return
 
-            # Send a request to the HUB API to sync analytics
-            smart_request(f'{HUB_API_ROOT}/v1/usage/anonymous',
-                          json=trace,
-                          headers=None,
-                          code=3,
-                          retry=0,
-                          verbose=False)
+        # Attempt to add to events
+        if len(self.events) < 25:  # Events list limited to 25 events (drop any events past this)
+            params = {**self.metadata, **{'task': cfg.task}}
+            if cfg.mode == 'export':
+                params['format'] = cfg.format
+            self.events.append({'name': cfg.mode, 'params': params})
+
+        # Check rate limit
+        t = time.time()
+        if (t - self.t) < self.rate_limit:
+            # Time is under rate limiter, wait to send
+            return
+
+        # Time is over rate limiter, send now
+        data = {'client_id': SETTINGS['uuid'], 'events': self.events}  # SHA-256 anonymized UUID hash and events list
+
+        # POST equivalent to requests.post(self.url, json=data)
+        smart_request('post', self.url, json=data, retry=0, verbose=False)
+
+        # Reset events and rate limit timer
+        self.events = []
+        self.t = t
 
 
 # Run below code on hub/utils init -------------------------------------------------------------------------------------
-
-traces = Traces()
+events = Events()
