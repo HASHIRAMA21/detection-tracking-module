@@ -247,4 +247,4 @@ This project is licensed under the GPL-3.0 License - see the [LICENSE](LICENSE) 
 - [DeepOCSORT](https://arxiv.org/abs/2302.11813) authors
 - [StrongSORT](https://arxiv.org/abs/2202.13514) authors
 - [ByteTrack](https://arxiv.org/abs/2110.06864) authors
-- MOT Challenge community for evaluation frameworks
+
